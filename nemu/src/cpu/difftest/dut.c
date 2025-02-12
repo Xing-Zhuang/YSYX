@@ -1,0 +1,143 @@
+/***************************************************************************************
+* Copyright (c) 2014-2022 Zihao Yu, Nanjing University
+*
+* NEMU is licensed under Mulan PSL v2.
+* You can use this software according to the terms and conditions of the Mulan PSL v2.
+* You may obtain a copy of Mulan PSL v2 at:
+*          http://license.coscl.org.cn/MulanPSL2
+*
+* THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+* EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+* MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+*
+* See the Mulan PSL v2 for more details.
+***************************************************************************************/
+
+#include <dlfcn.h>
+
+#include <isa.h>
+#include <cpu/cpu.h>
+#include <memory/paddr.h>
+#include <utils.h>
+#include <difftest-def.h>
+
+void (*ref_difftest_memcpy)(paddr_t addr, void *buf, size_t n, bool direction) = NULL;
+void (*ref_difftest_regcpy)(void *dut, bool direction) = NULL;
+void (*ref_difftest_exec)(uint64_t n) = NULL;
+void (*ref_difftest_raise_intr)(uint64_t NO) = NULL;
+
+#ifdef CONFIG_DIFFTEST
+
+static bool is_skip_ref = false;
+static int skip_dut_nr_inst = 0;
+
+// this is used to let ref skip instructions which
+// can not produce consistent behavior with NEMU
+void difftest_skip_ref() {//nemu执行ebreak指令的时候会调用该函数
+  is_skip_ref = true;
+  // If such an instruction is one of the instruction packing in QEMU
+  // (see below), we end the process of catching up with QEMU's pc to
+  // keep the consistent behavior in our best.
+  // Note that this is still not perfect: if the packed instructions
+  // already write some memory, and the incoming instruction in NEMU
+  // will load that memory, we will encounter false negative. But such
+  // situation is infrequent.
+  skip_dut_nr_inst = 0;
+}
+
+// this is used to deal with instruction packing in QEMU.
+// Sometimes letting QEMU step once will execute multiple instructions.
+// We should skip checking until NEMU's pc catches up with QEMU's pc.
+// The semantic is
+//   Let REF run `nr_ref` instructions first.
+//   We expect that DUT will catch up with REF within `nr_dut` instructions.
+void difftest_skip_dut(int nr_ref, int nr_dut) {
+  skip_dut_nr_inst += nr_dut;
+
+  while (nr_ref -- > 0) {
+    ref_difftest_exec(1);
+  }
+}
+
+//利用动态加载库机制（注意动态链接库和动态加载库的区别）
+// 加载/home/xz/ysyx-workbench/nemu/tools/spike-diff/build/riscv32-spike-so中的函数
+void init_difftest(char *ref_so_file, long img_size, int port) {
+  assert(ref_so_file != NULL);
+   
+  void *handle;
+  handle = dlopen(ref_so_file, RTLD_LAZY); //打开传入的动态库文件ref_so_file /home/xz/ysyx-workbench/nemu/tools/spike-diff/build/riscv32-spike-so
+  assert(handle);
+
+  ref_difftest_memcpy = dlsym(handle, "difftest_memcpy"); //在spike-diff/difftest.cc下实现的函数
+  assert(ref_difftest_memcpy);
+
+  ref_difftest_regcpy = dlsym(handle, "difftest_regcpy");
+  assert(ref_difftest_regcpy);
+
+  ref_difftest_exec = dlsym(handle, "difftest_exec");
+  assert(ref_difftest_exec);
+
+  ref_difftest_raise_intr = dlsym(handle, "difftest_raise_intr");
+  assert(ref_difftest_raise_intr);
+
+  void (*ref_difftest_init)(int) = dlsym(handle, "difftest_init");
+  assert(ref_difftest_init);
+
+  Log("Differential testing: %s", ANSI_FMT("ON", ANSI_FG_GREEN));
+  Log("The result of every instruction will be compared with %s. "
+      "This will help you a lot for debugging, but also significantly reduce the performance. "
+      "If it is not necessary, you can turn it off in menuconfig.", ref_so_file);
+
+  //RESET_VECTOR=0x80000000  guest_to_host(RESET_VECTOR)是pmem数组首地址 
+  //img_size=4096: 如果直接运行make run命令的话是4096， 如果在运行make ARCH=riscv32-nemu ALL=xxx run的话就是.bin文件的大小
+ 
+  ref_difftest_init(port);//对REF的DIffTest功能进行初始化, 具体行为因REF而异.
+  ref_difftest_memcpy(RESET_VECTOR, guest_to_host(RESET_VECTOR), img_size, DIFFTEST_TO_REF);//将中nemu的指令复制到REF中（img_size个字节）  
+  ref_difftest_regcpy(&cpu, DIFFTEST_TO_REF);//将nemu的寄存器状态拷贝到REF中.
+}
+
+static void checkregs(CPU_state *ref, vaddr_t pc) {
+  if (!isa_difftest_checkregs(ref, pc)) {
+    printf("difftest不一致\n");
+    nemu_state.state = NEMU_ABORT;
+    nemu_state.halt_pc = pc;
+    isa_reg_display();
+  }
+}
+
+//在NEMU中执行完一条指令后, 就在difftest_step()中让REF执行相同的指令, 然后读出REF中的寄存器, 并进行对比.
+void difftest_step(vaddr_t pc, vaddr_t npc) {
+   
+  CPU_state ref_r;
+
+  if (skip_dut_nr_inst > 0) {
+    printf("skip_dut_nr_inst");
+    ref_difftest_regcpy(&ref_r, DIFFTEST_TO_DUT);//将REF中的寄存器状态复制到ref_r
+    if (ref_r.pc == npc) {
+      skip_dut_nr_inst = 0;
+      checkregs(&ref_r, npc);
+      return;
+    }
+    skip_dut_nr_inst --;
+    if (skip_dut_nr_inst == 0)
+      panic("can not catch up with ref.pc = " FMT_WORD " at pc = " FMT_WORD, ref_r.pc, pc);
+    return;
+  }
+
+
+  //ref跳过一条指令
+  if (is_skip_ref) {
+    // to skip the checking of an instruction, just copy the reg state to reference design
+    ref_difftest_regcpy(&cpu, DIFFTEST_TO_REF);
+    is_skip_ref = false;
+    return;//直接返回，不进行下面的检查了
+  }
+
+  ref_difftest_exec(1);//在REF中执行一条指令 
+  ref_difftest_regcpy(&ref_r, DIFFTEST_TO_DUT);//将REF中的寄存器状态存入ref_r
+
+  checkregs(&ref_r, pc); //检查REF和DUT寄存器状态是否一致
+}
+#else
+void init_difftest(char *ref_so_file, long img_size, int port) { }
+#endif
